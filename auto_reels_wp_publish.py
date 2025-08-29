@@ -1,346 +1,477 @@
-# auto_reels_wp_publish.py
-# ============================================
-# WP -> Gera arte no padrão Boca -> Vídeo 10s -> Publica FB + IG Reels
-# Layout fixo, sem “escorregar” nada.
+# -*- coding: utf-8 -*-
+"""
+Auto Reels (WP → FB + IG) – FULL
+- Busca posts do WordPress
+- Extrai a 1ª imagem do conteúdo (preferência) ou usa destaque
+- Gera arte no padrão solicitado (logo acima da faixa vermelha, faixa vermelha robusta, título ajusta fonte sem vazar)
+- Adiciona rodapé @BOCANOTROMBONELITORAL
+- Renderiza VÍDEO (9:16, 10s) com áudio opcional (se audio_fundo.mp3 existir)
+- Sobe no Cloudinary (gera URL pública)
+- Publica no Facebook (vídeo) e Instagram (Reels) com espera até FINISHED
+- Guarda IDs processados em out/processed.json
+Requisitos:
+  pip install pillow requests python-dotenv cloudinary beautifulsoup4
+  FFmpeg no PATH
+  .env com: WP_URL, USER_ACCESS_TOKEN, FACEBOOK_PAGE_ID, INSTAGRAM_ID,
+            CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET
+Arquivos locais:
+  - logo_boca.png (PNG com transparência)
+  - Anton-Regular.ttf (fonte título)
+  - Roboto-Black.ttf (fonte categoria e rodapé)
+  - audio_fundo.mp3 (opcional)
+"""
 
-import os, io, re, time, json, subprocess, logging, textwrap
+import os, io, time, json, math, subprocess, textwrap, datetime
 from pathlib import Path
-from urllib.parse import urljoin
-from datetime import datetime
-
 import requests
-from requests.adapters import HTTPAdapter, Retry
 from bs4 import BeautifulSoup
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from dotenv import load_dotenv
 
-import cloudinary, cloudinary.uploader
-
-
-# --------- CONFIG BÁSICA ---------
+# ====== CONFIG BÁSICA ======
 load_dotenv()
-W, H = 1080, 1920
-TOP_H = 1080
+WP_URL      = os.getenv("WP_URL", "").rstrip("/")
+TOKEN       = os.getenv("USER_ACCESS_TOKEN", "")
+PAGE_ID     = os.getenv("FACEBOOK_PAGE_ID", "")
+IG_ID       = os.getenv("INSTAGRAM_ID", "")
+API_V       = os.getenv("API_VERSION", "v23.0")
 
-WP_URL = os.getenv("WP_URL", "").rstrip("/")
-PAGE_ID = os.getenv("FACEBOOK_PAGE_ID")
-IG_ID   = os.getenv("INSTAGRAM_ID")
-TOKEN   = os.getenv("USER_ACCESS_TOKEN")
-API_V   = os.getenv("API_VERSION", "v23.0")
+CLOUD_NAME  = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+CLOUD_KEY   = os.getenv("CLOUDINARY_API_KEY", "")
+CLOUD_SEC   = os.getenv("CLOUDINARY_API_SECRET", "")
 
-CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
-CLOUD_KEY  = os.getenv("CLOUDINARY_API_KEY")
-CLOUD_SEC  = os.getenv("CLOUDINARY_API_SECRET")
+BASE = Path(__file__).parent
+OUT  = BASE / "out"
+OUT.mkdir(exist_ok=True)
 
-VIDEO_SECONDS = int(os.getenv("VIDEO_SECONDS", "10"))
+# ====== AJUSTES VISUAIS – (você pode mexer SÓ AQUI) ======
+W, H                 = 1080, 1920               # vídeo/arte 9:16
+TOP_IMAGE_H          = int(H * 0.50)            # altura da imagem de topo
+LOGO_PATH            = BASE / "logo_boca.png"   # seu logo (PNG)
+LOGO_MAX_W           = 300                      # largura máx do logo
+LOGO_Y_FROM_TOPIMG   = TOP_IMAGE_H - 90         # Y do logo (fica acima da faixa vermelha)
+RED_BAR_H            = 260                      # altura da faixa vermelha (categoria) – “mais robusta”
+CATEGORY_TXT_SIZE    = 58                       # fonte base da categoria (vai em branco)
+CATEGORY_TXT_MARGINX = 36                       # margem horizontal dentro da faixa vermelha
 
-ANTON  = "Anton-Regular.ttf"
-ROBOTO = "Roboto-Black.ttf"
-LOGO   = "logo_boca.png"
-AUDIO  = "audio_fundo.mp3"
+WHITE_BOX_Y          = TOP_IMAGE_H + RED_BAR_H  # começa logo após faixa vermelha
+WHITE_BOX_H          = 520                      # altura da caixa branca (texto)
+WHITE_BOX_MARGIN     = 36                       # margem interna da caixa branca
 
-OUT_DIR = Path("out"); OUT_DIR.mkdir(exist_ok=True)
-PROCESSED_FILE = Path("processed_post_ids.txt")
+TITLE_MAX_FONTSIZE   = 64                       # teto da fonte do título (Anton)
+TITLE_MIN_FONTSIZE   = 42                       # piso para não ficar pequeno
+TITLE_LINE_SPACING   = 1.05                     # espaçamento entre linhas
+TITLE_MAX_LINES      = 6                        # limite de linhas
+TITLE_COLOR          = (0, 0, 0)
 
-# --------- LOG ---------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("auto-reels")
+RODAPE_TXT           = "@BOCANOTROMBONELITORAL" # rodapé
+RODAPE_SIZE          = 42                       # tamanho da fonte do rodapé
+RODAPE_Y             = H - 120                  # posição Y do rodapé
 
-# --------- HTTP SESSION COM RETRY ---------
-def http():
-    s = requests.Session()
-    r = Retry(total=3, backoff_factor=0.6, status_forcelist=[429,502,503,504])
-    s.mount("http://", HTTPAdapter(max_retries=r))
-    s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"User-Agent":"BocaAutoReels/1.0"})
-    return s
+BG_FILL_COLOR        = (0, 0, 0)                # cor de fundo
+RED_COLOR            = (229, 0, 0)              # vermelho da faixa
+WHITE_COLOR          = (255, 255, 255)
 
-S = http()
+FONT_ANTON_PATH      = BASE / "Anton-Regular.ttf"
+FONT_ROBOTO_PATH     = BASE / "Roboto-Black.ttf"
 
-# --------- UTILS ---------
-def read_processed():
-    if not PROCESSED_FILE.exists(): return set()
-    return set(x.strip() for x in PROCESSED_FILE.read_text(encoding="utf-8").splitlines() if x.strip())
+VIDEO_SECONDS        = 10                       # duração do vídeo
+SLEEP_BETWEEN_RUNS   = 300                      # loop: espera 5 min entre ciclos
 
-def add_processed(pid):
-    with PROCESSED_FILE.open("a", encoding="utf-8") as f:
-        f.write(str(pid)+"\n")
+# ====== LOG SIMPLES ======
+def log(msg, level="INFO"):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts} | {level} | {msg}", flush=True)
 
-def clean_text(html_or_text):
-    txt = BeautifulSoup(html_or_text or "", "html.parser").get_text(" ", strip=True)
-    # normaliza espaços
-    return re.sub(r"\s+", " ", txt).strip()
+# ====== SESSÃO HTTP COM RETRY ======
+SESSION = requests.Session()
+ADAPTER = requests.adapters.HTTPAdapter(max_retries=3)
+SESSION.mount("http://", ADAPTER)
+SESSION.mount("https://", ADAPTER)
+SESSION.headers.update({"User-Agent": "AutoReelsBot/1.0"})
 
-def find_first_image_url(html):
-    soup = BeautifulSoup(html or "", "html.parser")
-    img = soup.find("img")
-    return (img.get("src") if img else None)
-
-def download_image(url):
-    r = S.get(url, timeout=30)
-    r.raise_for_status()
-    # lida com avif/webp: se Pillow não tiver, converte via fallback da origem (quando possível)
-    img = Image.open(io.BytesIO(r.content))
-    if img.mode not in ("RGB","RGBA"):
-        img = img.convert("RGB")
-    return img
-
-# --------- RENDER ARTE FIXA ---------
-BLACK=(0,0,0); WHITE=(255,255,255); RED=(224,31,24); YELLOW=(255,204,0)
-
-def _font(path, size): return ImageFont.truetype(str(Path(path)), size)
-
-def _cover(img, box_w, box_h):
-    img = img.convert("RGB")
-    ratio = max(box_w / img.width, box_h / img.height)
-    im2 = img.resize((int(img.width*ratio), int(img.height*ratio)), Image.LANCZOS)
-    cx = (im2.width - box_w)//2
-    cy = (im2.height - box_h)//2
-    return im2.crop((cx, cy, cx+box_w, cy+box_h))
-
-def _round_rect(draw, xy, r, fill):
-    draw.rounded_rectangle(xy, radius=r, fill=fill)
-
-def _draw_centered_text(draw, text, font, y, max_w, fill=BLACK, line_spacing=10):
-    # quebra usando bbox real para não passar da caixa
-    words = text.strip()
-    # tentativa progressiva por largura média de linha
-    lines=[]
-    # quebra simples em blocos de ~32, depois ajusta se estourar
-    for chunk in textwrap.wrap(words, width=32):
-        # se ainda estourar largura, diminui o bloco
-        if draw.textbbox((0,0), chunk, font=font)[2] > max_w:
-            ok=False
-            for w in range(31,10,-1):
-                alt = textwrap.wrap(chunk, width=w)
-                if all(draw.textbbox((0,0), ln, font=font)[2] <= max_w for ln in alt):
-                    lines.extend(alt); ok=True; break
-            if not ok:
-                lines.append(chunk)
-        else:
-            lines.append(chunk)
-
-    for ln in lines:
-        tb = draw.textbbox((0,0), ln, font=font)
-        tw = tb[2]-tb[0]; th = tb[3]-tb[1]
-        draw.text(((W - tw)//2, y), ln, font=font, fill=fill)
-        y += th + line_spacing
-    return y
-
-def render_arte_fixa(bg_image, title, category, out_path):
-    canvas = Image.new("RGB", (W, H), BLACK)
-    draw = ImageDraw.Draw(canvas)
-
-    # foto topo
-    photo = _cover(bg_image, W, TOP_H)
-    canvas.paste(photo, (0,0))
-
-    # logo central encostando na faixa preta
+# ====== CLOUDINARY ======
+def cloudinary_init():
+    if not (CLOUD_NAME and CLOUD_KEY and CLOUD_SEC):
+        return False
     try:
-        logo = Image.open(LOGO).convert("RGBA")
-        lw=360; ratio=lw/logo.width
-        logo=logo.resize((lw, int(logo.height*ratio)), Image.LANCZOS)
-        lx=(W-logo.width)//2; ly=TOP_H - logo.height//2
-        canvas.paste(logo, (lx,ly), mask=logo)
+        import cloudinary
+        cloudinary.config(
+            cloud_name=CLOUD_NAME,
+            api_key=CLOUD_KEY,
+            api_secret=CLOUD_SEC,
+            secure=True
+        )
+        return True
     except Exception as e:
-        log.warning(f"⚠️  Erro ao aplicar logo: {e}")
+        log(f"Cloudinary init falhou: {e}", "ERROR")
+        return False
 
-    # pílula vermelha (maior)
-    cat = (category or "DESTAQUES").strip().upper()
-    f_cat = _font(ROBOTO, 60)
-    tw = draw.textbbox((0,0), cat, font=f_cat)[2]
-    pill_w = max(int(W*0.60), tw+160)  # ≥ 60% da largura
-    pill_h = 118
-    pill_y = TOP_H + 64
-    pill_x0 = (W - pill_w)//2
-    _round_rect(draw, (pill_x0, pill_y, pill_x0+pill_w, pill_y+pill_h), 18, RED)
-    tb = draw.textbbox((0,0), cat, font=f_cat)
-    draw.text(((W - (tb[2]-tb[0]))//2, pill_y + (pill_h - (tb[3]-tb[1]))//2 - 2), cat, font=f_cat, fill=WHITE)
+def cloudinary_upload_video(path: Path) -> str:
+    import cloudinary.uploader
+    res = cloudinary.uploader.upload_large(
+        str(path),
+        resource_type="video",
+        timeout=600,
+        folder="auto_reels",
+        overwrite=True
+    )
+    return res["secure_url"]
 
-    # caixa branca do título
-    margin_x=44
-    box_top = pill_y + pill_h + 42
-    box_bottom = box_top + 330
-    _round_rect(draw, (margin_x, box_top, W-margin_x, box_bottom), 18, WHITE)
-
-    # título ANTON maior
-    title_up = (title or "").strip().upper()
-    f_title = _font(ANTON, 64)
-    inner_w = W - 2*margin_x - 60
-    _draw_centered_text(draw, title_up, f_title, box_top+36, inner_w, fill=BLACK, line_spacing=12)
-
-    # assinatura
-    handle = "@BOCANOTROMBONELITORAL"
-    f_sign = _font(ROBOTO, 40)
-    tb = draw.textbbox((0,0), handle, font=f_sign)
-    draw.text(((W - (tb[2]-tb[0]))//2, box_bottom + 26), handle, font=f_sign, fill=YELLOW)
-
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(out_path, "JPEG", quality=92, optimize=True)
-    return out_path
-
-# --------- VÍDEO COM FFMPEG ---------
-def make_video_from_image(img_path, out_mp4, seconds=10):
-    cmd = [
-        "ffmpeg","-y",
-        "-loop","1","-r","25",
-        "-i", img_path,
-        "-stream_loop","-1","-i", AUDIO,
-        "-t", str(seconds),
-        "-vf","scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
-        "-c:v","libx264","-pix_fmt","yuv420p",
-        "-c:a","aac","-b:a","128k",
-        "-movflags","+faststart",
-        out_mp4
-    ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return out_mp4
-
-# --------- PUBLICAÇÃO FB/IG ---------
-def upload_cloudinary(path):
-    cloudinary.config(cloud_name=CLOUD_NAME, api_key=CLOUD_KEY, api_secret=CLOUD_SEC, secure=True)
-    r = cloudinary.uploader.upload_large(path, resource_type="video", chunk_size=6_000_000)
-    return r["secure_url"]
-
-def fb_upload_video(page_id, token, video_url, caption):
-    r = S.post(f"https://graph.facebook.com/{API_V}/{page_id}/videos",
-               data={"file_url": video_url, "description": caption, "access_token": token}, timeout=60)
-    r.raise_for_status()
-    return r.json().get("id")
-
-def ig_create_container(ig_id, token, video_url, caption):
-    r = S.post(f"https://graph.facebook.com/{API_V}/{ig_id}/media",
-               data={"media_type":"REELS","video_url": video_url,
-                     "caption": caption, "access_token": token}, timeout=60)
-    r.raise_for_status()
-    return r.json()["id"]
-
-def ig_publish_container(ig_id, token, creation_id):
-    r = S.post(f"https://graph.facebook.com/{API_V}/{ig_id}/media_publish",
-               data={"creation_id": creation_id, "access_token": token}, timeout=60)
+# ====== WP FETCH ======
+def wp_latest_posts(limit=5):
+    url = f"{WP_URL}/wp-json/wp/v2/posts?per_page={limit}&orderby=date&_fields=id,title,excerpt,featured_media,content,link,categories"
+    r = SESSION.get(url, timeout=30)
     r.raise_for_status()
     return r.json()
 
-def ig_check_status(creation_id, token):
-    r = S.get(f"https://graph.facebook.com/{API_V}/{creation_id}",
-              params={"fields":"status_code,status","access_token": token}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def pick_category_name(post):
+    # tenta extrair alguma categoria textual do título/emoji; senão "Notícias"
+    t = post.get("title", {}).get("rendered", "") or ""
+    # se vier prefixos como "🚨", "‼️", etc, você pode mapear aqui:
+    if "Polícia" in t or "🚔" in t or "🚨" in t:
+        return "POLÍCIA"
+    if "Pronto Falei" in t or "‼️" in t:
+        return "PRONTO FALEI"
+    return "NOTÍCIAS"
 
-# --------- WP FETCH ---------
-def fetch_wp_posts():
-    url = f"{WP_URL}/wp-json/wp/v2/posts"
-    params = {
-        "per_page": 5,
-        "orderby": "date",
-        "_fields": "id,title,excerpt,featured_media,content,link,categories"
-    }
-    r = S.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def extract_title_text(post) -> str:
+    from html import unescape
+    raw = post.get("title", {}).get("rendered", "") or ""
+    # tira HTML simples
+    soup = BeautifulSoup(raw, "html.parser")
+    txt = soup.get_text(" ", strip=True)
+    return unescape(txt)
 
-def get_featured_src(post):
-    # tenta no content primeiro
-    img = find_first_image_url(post.get("content",{}).get("rendered",""))
-    if img: return img
-    # fallback: thumbnail padrão WP (usando wp-json do media)
-    media_id = post.get("featured_media")
-    if media_id:
-        try:
-            m = S.get(f"{WP_URL}/wp-json/wp/v2/media/{media_id}", timeout=20)
-            if m.ok:
-                j = m.json()
-                return j.get("source_url")
-        except Exception:
-            pass
+def find_first_image_in_content(post) -> str | None:
+    html = post.get("content", {}).get("rendered", "") or ""
+    soup = BeautifulSoup(html, "html.parser")
+    img = soup.find("img")
+    if img and img.get("src"):
+        return img["src"]
     return None
 
-def guess_category_name(cat_id_list):
-    if not cat_id_list: return "DESTAQUES"
-    # opcional: consultar /wp/v2/categories?id=...
-    return "DESTAQUES"
-
-# --------- MAIN LOOP ---------
-def process_post(p):
-    pid = p["id"]
-    title = clean_text(p.get("title",{}).get("rendered","")).strip()
-    category = guess_category_name(p.get("categories") or [])
-    img_url = get_featured_src(p)
-
-    if not title: 
-        log.info(f"→ Post {pid} sem título – pulando"); return
-
+def download_image_rgb(url: str) -> Image.Image | None:
     try:
-        if not img_url:
-            log.info(f"→ Post {pid} sem imagem – usando fallback cinza")
-            bg = Image.new("RGB",(1080,1080),(30,30,30))
+        r = SESSION.get(url, timeout=30)
+        r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content))
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
         else:
-            bg = download_image(img_url)
-
-        arte = str(OUT_DIR / f"arte_{pid}.jpg")
-        render_arte_fixa(bg, title, category, arte)
-        log.info(f"✅ Arte: {arte}")
-
-        mp4 = str(OUT_DIR / f"reel_{pid}.mp4")
-        make_video_from_image(arte, mp4, VIDEO_SECONDS)
-        log.info(f"✅ Vídeo: {mp4}")
-
-        # legenda (começo do conteúdo + crédito)
-        excerpt = clean_text(p.get("excerpt",{}).get("rendered",""))
-        content = clean_text(p.get("content",{}).get("rendered",""))
-        snippet = (content or excerpt or title)[:400]
-        caption = f"{title}\n\n{snippet}\n\nLeia mais: jornalvozdolitoral.com"
-
-        # Cloudinary
-        url = upload_cloudinary(mp4)
-        log.info(f"☁️  Cloudinary OK: {url}")
-
-        # Facebook vídeo
-        try:
-            fb_id = fb_upload_video(PAGE_ID, TOKEN, url, caption)
-            log.info(f"📘 Publicado na Página (vídeo): id={fb_id}")
-        except Exception as e:
-            log.error(f"❌ FB falhou: {e}")
-
-        # Instagram Reels
-        try:
-            creation = ig_create_container(IG_ID, TOKEN, url, caption)
-            # poll até FINISHED (máx ~2 min)
-            for _ in range(24):
-                st = ig_check_status(creation, TOKEN)
-                sc = st.get("status_code")
-                log.info(f"⏳ IG status: {sc}")
-                if sc in ("FINISHED","ERROR"):
-                    break
-                time.sleep(5)
-            if sc == "FINISHED":
-                ig_publish_container(IG_ID, TOKEN, creation)
-                log.info("🎬 IG Reels publicado!")
-            else:
-                log.error(f"❌ IG não finalizou: {st}")
-        except Exception as e:
-            log.error(f"❌ IG falhou: {e}")
-
-        add_processed(pid)
-
+            img = img.convert("RGB")
+        return img
     except Exception as e:
-        log.error(f"❌ Falha post {pid}: {e}")
+        log(f"⚠️  Não baixei imagem: {e}", "INFO")
+        return None
+
+def object_fit_cover(src: Image.Image, box_w: int, box_h: int) -> Image.Image:
+    # recorte tipo CSS object-fit: cover mantendo centro
+    sw, sh = src.size
+    scale = max(box_w / sw, box_h / sh)
+    nw, nh = int(sw * scale), int(sh * scale)
+    img = src.resize((nw, nh), Image.LANCZOS)
+    x = (nw - box_w) // 2
+    y = (nh - box_h) // 2
+    return img.crop((x, y, x + box_w, y + box_h))
+
+# ====== TIPOGRAFIA ======
+def load_font(path: Path, size: int, fallback="DejaVuSans.ttf"):
+    try:
+        return ImageFont.truetype(str(path), size=size, layout_engine=ImageFont.LAYOUT_RAQM)
+    except:
+        return ImageFont.truetype(fallback, size=size)
+
+def draw_centered_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, box, fill=(255,255,255), line_spacing=1.0):
+    x0, y0, x1, y1 = box
+    w_box = x1 - x0
+    h_box = y1 - y0
+    lines = text.split("\n")
+    # calcula altura total
+    line_h = font.getbbox("Ay")[3] - font.getbbox("Ay")[1]
+    total_h = int(sum((line_h * line_spacing) for _ in lines))
+    y = y0 + (h_box - total_h) // 2
+    for line in lines:
+        tw = font.getlength(line)
+        tx = x0 + (w_box - int(tw)) // 2
+        draw.text((tx, y), line, font=font, fill=fill)
+        y += int(line_h * line_spacing)
+
+def fit_title_in_box(draw, text, font_path, box, max_size, min_size, max_lines, line_spacing=1.05):
+    x0, y0, x1, y1 = box
+    Wb, Hb = x1 - x0, y1 - y0
+    # tenta do maior pro menor
+    for size in range(max_size, min_size - 1, -2):
+        font = load_font(font_path, size)
+        # tenta quebrar em linhas que caibam na largura
+        wrapped = []
+        for paragraph in text.split("\n"):
+            # quebra por largura
+            words = paragraph.strip().split()
+            if not words:
+                wrapped.append("")
+                continue
+            line = words[0]
+            for w in words[1:]:
+                if font.getlength(line + " " + w) <= (Wb - 2):
+                    line += " " + w
+                else:
+                    wrapped.append(line)
+                    line = w
+            wrapped.append(line)
+        # corta se exceder max_lines
+        if len(wrapped) > max_lines:
+            wrapped = wrapped[:max_lines-1] + [wrapped[max_lines-1] + "…"]
+        # mede altura total
+        line_h = font.getbbox("Ay")[3] - font.getbbox("Ay")[1]
+        total_h = int(len(wrapped) * line_h * line_spacing)
+        if total_h <= Hb:
+            return font, "\n".join(wrapped)
+    # fallback
+    return load_font(font_path, min_size), textwrap.shorten(text, width=120, placeholder="…")
+
+# ====== ARTE ======
+def render_art(post, save_path: Path) -> Path:
+    # base
+    canvas = Image.new("RGB", (W, H), BG_FILL_COLOR)
+    draw = ImageDraw.Draw(canvas)
+
+    # imagem topo (cover)
+    img_url = find_first_image_in_content(post)
+    if img_url:
+        bg = download_image_rgb(img_url)
+    else:
+        bg = None
+
+    if bg is None:
+        # fundo liso se faltar
+        top = Image.new("RGB", (W, TOP_IMAGE_H), (20,20,20))
+    else:
+        top = object_fit_cover(bg, W, TOP_IMAGE_H)
+    canvas.paste(top, (0, 0))
+
+    # LOGO (acima da faixa vermelha)
+    if LOGO_PATH.exists():
+        try:
+            logo = Image.open(LOGO_PATH).convert("RGBA")
+            # escala
+            w_ratio = min(LOGO_MAX_W / logo.width, 1.0)
+            new_w = int(logo.width * w_ratio)
+            new_h = int(logo.height * w_ratio)
+            logo = logo.resize((new_w, new_h), Image.LANCZOS)
+            lx = (W - new_w)//2
+            ly = max(0, LOGO_Y_FROM_TOPIMG - new_h)  # garante que fica no topo da imagem
+            canvas.paste(logo, (lx, ly), logo)
+        except Exception as e:
+            log(f"⚠️  Erro ao aplicar logo: {e}", "INFO")
+
+    # FAIXA VERMELHA (categoria)
+    y_red0 = TOP_IMAGE_H
+    y_red1 = TOP_IMAGE_H + RED_BAR_H
+    draw.rectangle([0, y_red0, W, y_red1], fill=RED_COLOR)
+
+    categoria = pick_category_name(post)
+    cat_font = load_font(FONT_ROBOTO_PATH, CATEGORY_TXT_SIZE)
+    cat_w = cat_font.getlength(categoria.upper())
+    cat_h = cat_font.getbbox("Ay")[3] - cat_font.getbbox("Ay")[1]
+    cat_x = (W - int(cat_w))//2
+    cat_y = y_red0 + (RED_BAR_H - cat_h)//2
+    draw.text((cat_x, cat_y), categoria.upper(), font=cat_font, fill=WHITE_COLOR)
+
+    # CAIXA BRANCA (título)
+    y_white0 = WHITE_BOX_Y
+    y_white1 = WHITE_BOX_Y + WHITE_BOX_H
+    draw.rectangle([0, y_white0, W, y_white1], fill=WHITE_COLOR)
+
+    title = extract_title_text(post)
+    title_box = (WHITE_BOX_MARGIN,
+                 y_white0 + WHITE_BOX_MARGIN,
+                 W - WHITE_BOX_MARGIN,
+                 y_white1 - WHITE_BOX_MARGIN)
+
+    title_font, wrapped = fit_title_in_box(
+        draw, title, FONT_ANTON_PATH, title_box,
+        max_size=TITLE_MAX_FONTSIZE,
+        min_size=TITLE_MIN_FONTSIZE,
+        max_lines=TITLE_MAX_LINES,
+        line_spacing=TITLE_LINE_SPACING
+    )
+    draw_centered_text(draw, wrapped, title_font, title_box, fill=TITLE_COLOR, line_spacing=TITLE_LINE_SPACING)
+
+    # RODAPÉ
+    rod_font = load_font(FONT_ROBOTO_PATH, RODAPE_SIZE)
+    rod_w = rod_font.getlength(RODAPE_TXT)
+    rod_h = rod_font.getbbox("Ay")[3] - rod_font.getbbox("Ay")[1]
+    rx = (W - int(rod_w))//2
+    ry = RODAPE_Y
+    draw.text((rx, ry), RODAPE_TXT, font=rod_font, fill=WHITE_COLOR)
+
+    canvas.save(save_path, "JPEG", quality=92, optimize=True, progressive=True)
+    return save_path
+
+# ====== VÍDEO (FFMPEG) ======
+def make_video(jpg: Path, mp4_out: Path, seconds=10):
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-i", str(jpg)
+    ]
+    audio = BASE / "audio_fundo.mp3"
+    if audio.exists():
+        cmd += ["-i", str(audio), "-shortest"]
+    cmd += [
+        "-t", str(seconds),
+        "-r", "25",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p"
+    ]
+    if audio.exists():
+        cmd += ["-c:a", "aac", "-b:a", "128k"]
+    cmd += [str(mp4_out)]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return mp4_out
+
+# ====== FACEBOOK PAGE (VÍDEO) ======
+def fb_publish_video(page_id: str, token: str, file_url: str, description: str) -> str | None:
+    url = f"https://graph.facebook.com/{API_V}/{page_id}/videos"
+    data = {
+        "access_token": token,
+        "file_url": file_url,
+        "description": description[:2200]
+    }
+    r = SESSION.post(url, data=data, timeout=120)
+    if r.status_code == 200:
+        return r.json().get("id")
+    log(f"❌ FB /videos falhou: {r.status_code} | {r.text}", "ERROR")
+    return None
+
+# ====== INSTAGRAM (REELS) ======
+def ig_create_container(ig_id: str, token: str, video_url: str, caption: str) -> str | None:
+    url = f"https://graph.facebook.com/{API_V}/{ig_id}/media"
+    data = {
+        "access_token": token,
+        "media_type": "REELS",
+        "video_url": video_url,
+        "caption": caption[:2200]
+    }
+    r = SESSION.post(url, data=data, timeout=120)
+    if r.status_code == 200:
+        return r.json().get("id")
+    log(f"❌ IG /media falhou: {r.status_code} | {r.text}", "ERROR")
+    return None
+
+def ig_wait_finished(container_id: str, token: str, max_wait=300) -> bool:
+    url = f"https://graph.facebook.com/{API_V}/{container_id}"
+    waited = 0
+    while waited <= max_wait:
+        r = SESSION.get(url, params={"access_token": token, "fields": "status_code,status"}, timeout=60)
+        if r.status_code == 200:
+            st = r.json().get("status_code")
+            log(f"⏳ IG status: {st}", "INFO")
+            if st == "FINISHED":
+                return True
+            if st == "ERROR":
+                return False
+        time.sleep(10)
+        waited += 10
+    return False
+
+def ig_publish(ig_id: str, token: str, creation_id: str) -> bool:
+    url = f"https://graph.facebook.com/{API_V}/{ig_id}/media_publish"
+    data = {"access_token": token, "creation_id": creation_id}
+    r = SESSION.post(url, data=data, timeout=120)
+    if r.status_code == 200:
+        return True
+    log(f"❌ IG /media_publish falhou: {r.status_code} | {r.text}", "ERROR")
+    return False
+
+# ====== PROCESSADOS ======
+PROC_FILE = OUT / "processed.json"
+def load_processed():
+    if PROC_FILE.exists():
+        try:
+            return set(json.loads(PROC_FILE.read_text(encoding="utf-8")))
+        except:
+            return set()
+    return set()
+
+def save_processed(s: set):
+    PROC_FILE.write_text(json.dumps(sorted(list(s))), encoding="utf-8")
+
+# ====== LOOP PRINCIPAL ======
+def process_once():
+    # valida env
+    for k, v in [("WP_URL", WP_URL), ("TOKEN", TOKEN), ("PAGE_ID", PAGE_ID), ("IG_ID", IG_ID),
+                 ("CLOUDINARY_CLOUD_NAME", CLOUD_NAME), ("CLOUDINARY_API_KEY", CLOUD_KEY), ("CLOUDINARY_API_SECRET", CLOUD_SEC)]:
+        if not v:
+            log(f"❌ Variável ausente: {k}", "ERROR")
+            return
+
+    posts = wp_latest_posts(limit=5)
+    log(f"→ Recebidos {len(posts)} posts", "INFO")
+
+    processed = load_processed()
+    cloud_ok = cloudinary_init()
+
+    for post in posts:
+        pid = post["id"]
+        if str(pid) in processed:
+            continue
+
+        try:
+            log(f"🎨 Arte post {pid}…", "INFO")
+            arte_path = OUT / f"arte_{pid}.jpg"
+            render_art(post, arte_path)
+            log(f"✅ Arte: {arte_path}", "INFO")
+
+            mp4_path = OUT / f"reel_{pid}.mp4"
+            log("🎬 Gerando vídeo 10s…", "INFO")
+            make_video(arte_path, mp4_path, VIDEO_SECONDS)
+            log(f"✅ Vídeo: {mp4_path}", "INFO")
+
+            # sobe pro cloudinary
+            if not cloud_ok:
+                log("❌ Cloudinary não configurado.", "ERROR")
+                return
+            url_video = cloudinary_upload_video(mp4_path)
+
+            # capção básica
+            title = extract_title_text(post)
+            link  = post.get("link", "")
+            categoria = pick_category_name(post)
+            caption = f"{title}\n\nCategoria: {categoria}\nLeia mais: {link}\n#BocaNoTrombone #Ilhabela"
+
+            # 1) Facebook Page /videos
+            vid_id = fb_publish_video(PAGE_ID, TOKEN, url_video, caption)
+            if vid_id:
+                log(f"📘 Publicado na Página (vídeo): id={vid_id}", "INFO")
+
+            # 2) Instagram Reels com espera
+            creation = ig_create_container(IG_ID, TOKEN, url_video, caption)
+            if creation:
+                if ig_wait_finished(creation, TOKEN, max_wait=480):
+                    if ig_publish(IG_ID, TOKEN, creation):
+                        log("🎬 IG Reels publicado!", "INFO")
+                    else:
+                        log("⚠️ IG publish falhou mesmo após FINISHED.", "ERROR")
+                else:
+                    log("⚠️ IG não ficou FINISHED a tempo.", "ERROR")
+
+            processed.add(str(pid))
+            save_processed(processed)
+            time.sleep(2)
+
+        except subprocess.CalledProcessError as e:
+            log(f"❌ FFmpeg falhou: {e}", "ERROR")
+        except requests.RequestException as e:
+            log(f"❌ HTTP falhou: {e}", "ERROR")
+        except Exception as e:
+            log(f"❌ Falha post {pid}: {e}", "ERROR")
 
 def main():
-    log.info("🚀 Auto Reels (WP→FB+IG) iniciado")
-    processed = read_processed()
-    posts = fetch_wp_posts()
-    log.info(f"→ Recebidos {len(posts)} posts")
-    for p in posts:
-        if str(p["id"]) in processed:
-            continue
-        log.info(f"🎨 Arte post {p['id']}…")
-        process_post(p)
-    log.info("⏳ Fim do ciclo.")
+    log("🚀 Auto Reels (WP→FB+IG) iniciado", "INFO")
+    while True:
+        process_once()
+        log("⏳ Fim do ciclo.", "INFO")
+        time.sleep(SLEEP_BETWEEN_RUNS)
 
 if __name__ == "__main__":
     main()
